@@ -168,8 +168,13 @@
   "addons": [
     "heroku-postgresql:standard-0",
     "mailgun:starter",
-    "heroku-redis:hobby-dev",
-    "bucketeer:hobbyist"
+    "bucketeer:hobbyist",
+    {
+      "plan": "heroku-redis:hobby-dev",
+      "options": {
+        "maxmemory-policy": "volatile-lru"
+      }
+    }
   ],
   "formation": {
     "web": {
