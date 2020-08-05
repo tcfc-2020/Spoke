@@ -13,6 +13,7 @@ export const DEFAULT_NGP_VAN_EXPORT_JOB_TYPE_ID = 8;
 export const DEFAULT_PHONE_NUMBER_COUNTRY = "US";
 
 export function displayName() {
+  console.log("Displaying Name");
   return "NGP VAN";
 }
 
@@ -42,6 +43,7 @@ export const handleFailedContactLoad = async (
 ) => {
   // eslint-disable-next-line no-console
   console.error(message);
+  console.log("HandleFailedContactLoad");
   await failedContactLoad(job, null, JSON.stringify(ingestDataReference), {
     errors: [message],
     ...ingestDataReference
@@ -62,6 +64,8 @@ export async function available(organization, user) {
     !!getConfig("NGP_VAN_APP_NAME", organization) &&
     !!getConfig("NGP_VAN_WEBHOOK_BASE_URL", organization);
 
+  console.log("Attempting to make contact loader available");
+  
   if (!result) {
     console.log(
       "ngpvan contact loader unavailable. Missing one or more required environment variables."
@@ -101,6 +105,9 @@ export function clientChoiceDataCacheKey(organization, campaign, user) {
 
 export async function getClientChoiceData(organization, campaign, user) {
   let responseJson;
+  console.log("Attempting to getClientChoiceData");
+  console.log(campaign);
+  console.log(user);
 
   try {
     const maxPeopleCount =
