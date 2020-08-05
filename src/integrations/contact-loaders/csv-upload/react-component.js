@@ -32,6 +32,7 @@ export const ensureCamelCaseRequiredHeaders = columnHeader => {
    * If other fields that could be either snake_case or camelCase
    * are added to `requiredUploadFields` it will do the same for them.
    * */
+  console.log("Ensuring Camel Case");
   const camelizedColumnHeader = humps.camelize(columnHeader);
   if (
     requiredUploadFields.includes(camelizedColumnHeader) &&
@@ -79,6 +80,7 @@ export class CampaignContactsForm extends React.Component {
   };
 
   handleUpload = event => {
+    console.log("Handling Upload");
     event.preventDefault();
     const file = event.target.files[0];
     this.setState({ uploading: true }, () => {
@@ -197,7 +199,7 @@ export class CampaignContactsForm extends React.Component {
       <div>
         <RaisedButton
           style={innerStyles.button}
-          label={uploading ? "Uploading..." : "Upload contacts"}
+          label={uploading ? "Uploading..." : "(AK) Upload contacts"}
           labelPosition="before"
           disabled={uploading}
           onClick={() => this.uploadButton.click()}
