@@ -18,11 +18,15 @@ const styles = StyleSheet.create({
 
 export class CampaignContactsForm extends React.Component {
   constructor(props) {
+    console.log("In Constructor");
+    console.log(props);
     super(props);
     const { lastResult } = this.props;
     const reference =
       lastResult && lastResult.reference && JSON.parse(lastResult.reference);
     const searchText = (reference && reference.savedListName) || undefined;
+    console.log("Search Text");
+    console.log(searchText);
     this.state = {
       errorResult: undefined,
       savedListId: undefined,
@@ -31,7 +35,9 @@ export class CampaignContactsForm extends React.Component {
   }
 
   buildSelectData = () => {
+    console.log("Getting Build Select Data");
     const { clientChoiceData } = this.props;
+    console.log(clientChoiceData);
     const clientChoiceDataObject = JSON.parse(clientChoiceData);
     return clientChoiceDataObject.items.map(item =>
       dataSourceItem(item.name, item.savedListId)
@@ -39,7 +45,9 @@ export class CampaignContactsForm extends React.Component {
   };
 
   renderSavedLists = () => {
+    console.log("Rendering Saved Lists");
     const selectData = this.buildSelectData();
+    console.log(selectData);
     return (
       <AutoComplete
         ref="autocomplete"
