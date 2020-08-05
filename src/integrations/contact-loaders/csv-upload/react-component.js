@@ -199,7 +199,7 @@ export class CampaignContactsForm extends React.Component {
       <div>
         <RaisedButton
           style={innerStyles.button}
-          label={uploading ? "Uploading..." : "(AK) Upload contacts"}
+          label={uploading ? "Uploading..." : "Upload contacts"}
           labelPosition="before"
           disabled={uploading}
           onClick={() => this.uploadButton.click()}
