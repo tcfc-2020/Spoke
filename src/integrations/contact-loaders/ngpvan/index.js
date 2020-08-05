@@ -121,8 +121,10 @@ export async function getClientChoiceData(organization, campaign, user) {
       retries: 0,
       timeout: 5000
     });
-
+    
+    console.log("Awaiting Response...");
     responseJson = await response.json();
+    console.log(responseJson);
   } catch (error) {
     const message = `Error retrieving saved list metadata from VAN ${error}`;
     // eslint-disable-next-line no-console
