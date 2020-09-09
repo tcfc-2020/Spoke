@@ -29,6 +29,9 @@ const getDocument = async documentId => {
   return result;
 };
 
+let actionHandlers = {};
+let namedStyles = [];
+const getNamedStyle = style => namedStyles.find(x => x.namedStyleType === style);
 const getParagraphStyle = getOr("", "paragraph.paragraphStyle.namedStyleType");
 const getTextRun = getOr("", "textRun.content");
 const sanitizeTextRun = textRun => textRun.replace("\n", "");
@@ -49,10 +52,26 @@ const getParagraphBold = compose(
   find(getTextRun),
   getOr([], "paragraph.elements")
 );
+const namedStyleBold = compose(
+  getOr(false, "textStyle.bold"),
+  getNamedStyle,
+  getParagraphStyle
+);
+const getParagraphItalic = compose(
+  getOr(false, "textRun.textStyle.italic"),
+  find(getTextRun),
+  getOr([], "paragraph.elements")
+);
+const namedStyleItalic = compose(
+  getOr(false, "textStyle.italic"),
+  getNamedStyle,
+  getParagraphStyle
+);
 const getParagraph = element => ({
   style: getParagraphStyle(element),
   indent: getParagraphIndent(element),
-  isParagraphBold: getParagraphBold(element),
+  isParagraphBold: namedStyleBold(element) || getParagraphBold(element),
+  isParagraphItalic: namedStyleItalic(element) || getParagraphItalic(element),
   text: getParagraphText(element)
 });
 const hasParagraph = has("paragraph");
@@ -113,6 +132,8 @@ const getInteractions = sections =>
   getSectionParagraphs(sections, "Interactions");
 const getCannedResponses = sections =>
   getSectionParagraphs(sections, "Canned Responses");
+const getActionHandlers = sections =>
+  getSectionParagraphs(sections, "Action Handlers");
 
 const isNextChunkAQuestion = (interactionParagraphs, currentIndent) =>
   interactionParagraphs.length > 1 &&
@@ -192,7 +213,17 @@ const makeInteractionHierarchy = (
       !interactionParagraphs[0].isParagraphBold
     ) {
       const interactionParagraph = interactionParagraphs.shift();
-      interactionsHierarchyNode.script.push(interactionParagraph.text);
+      if (interactionParagraph.isParagraphItalic) {
+        // Italic = action handler.
+        const handlerLabel = interactionParagraph.text.trim().toLowerCase();
+        const handler = actionHandlers[handlerLabel];
+        if (!handler) continue;
+        interactionsHierarchyNode.action = handler.name;
+        interactionsHierarchyNode.action_data = handler.data;
+      } else {
+        // Regular text, add to script.
+        interactionsHierarchyNode.script.push(interactionParagraph.text);
+      }
     }
 
     if (!interactionsHierarchyNode.script[0]) {
@@ -244,8 +275,8 @@ const saveInteractionsHierarchyNode = async (
       question: interactionsHierarchyNode.question || "",
       script: interactionsHierarchyNode.script.join("\n") || "",
       answer_option: interactionsHierarchyNode.answer || "",
-      answer_actions: "",
-      answer_actions_data: "",
+      answer_actions: interactionsHierarchyNode.action || "",
+      answer_actions_data: interactionsHierarchyNode.action_data || "",
       campaign_id: campaignId,
       is_deleted: false
     })
@@ -289,7 +320,8 @@ const makeCannedResponsesList = cannedResponsesParagraphs => {
   const cannedResponses = [];
   while (cannedResponsesParagraphs[0]) {
     const cannedResponse = {
-      text: []
+      text: [],
+      tagIds: []
     };
 
     const paragraph = cannedResponsesParagraphs.shift();
@@ -305,7 +337,17 @@ const makeCannedResponsesList = cannedResponsesParagraphs => {
       !cannedResponsesParagraphs[0].isParagraphBold
     ) {
       const textParagraph = cannedResponsesParagraphs.shift();
-      cannedResponse.text.push(textParagraph.text);
+      if (textParagraph.isParagraphItalic) {
+        // Italic = tag.
+        const tagId = textParagraph.text.match(/^\d*\b/);
+        if (tagId && !!tagId[0]) {
+          cannedResponse.tagIds.push(tagId[0])
+        }
+      }
+      else {
+        // Regular text, add to response.
+        cannedResponse.text.push(textParagraph.text);
+      }
     }
 
     if (!cannedResponse.text[0]) {
@@ -324,33 +366,96 @@ const replaceCannedResponsesInDatabase = async (
   campaignId,
   cannedResponses
 ) => {
+  const convertedResponses = [];
+  for (let index = 0; index < cannedResponses.length; index++) {
+    const response = cannedResponses[index];
+    convertedResponses.push({
+      ...response,
+      text: response.text.join("\n"),
+      campaign_id: campaignId,
+      id: undefined
+    });
+  }
+
+  // delete canned response / tag relations from tag_canned_response
   await r.knex.transaction(async trx => {
-    try {
-      await r
+    await trx("tag_canned_response")
+      .whereIn(
+        "canned_response_id",
+        r
         .knex("canned_response")
-        .transacting(trx)
+        .select("id")
         .where({
           campaign_id: campaignId
         })
-        .whereNull("user_id")
-        .delete();
+      )
+      .delete();
+    // delete canned responses
+    await trx("canned_response")
+      .where({
+        campaign_id: campaignId
+      })
+      .whereNull("user_id")
+      .delete();
 
-      for (const cannedResponse of cannedResponses) {
-        await r.knex
-          .insert({
-            campaign_id: campaignId,
-            user_id: null,
-            title: cannedResponse.title,
-            text: cannedResponse.text.join("\n")
-          })
-          .into("canned_response")
-          .transacting(trx);
-      }
-    } catch (exception) {
-      console.log(exception);
-      throw exception;
-    }
+    // save new canned responses and add their ids with related tag ids to tag_canned_response
+    const saveCannedResponse = async cannedResponse => {
+      const [res] = await trx("canned_response").insert(
+        cannedResponse, [
+          "id"
+        ]);
+      return res.id;
+    };
+    const tagCannedResponses = await Promise.all(
+      convertedResponses.map(async response => {
+        const {
+          tagIds,
+          ...filteredResponse
+        } = response;
+        const responseId = await saveCannedResponse(
+          filteredResponse);
+        return (tagIds || []).map(t => ({
+          tag_id: t,
+          canned_response_id: responseId
+        }));
+      })
+    );
+    await trx("tag_canned_response").insert(_.flatten(
+    tagCannedResponses));
   });
+};
+
+const makeActionHandlersList = actionHandlerParagraphs => {
+  const actionHandlers = {};
+  while (actionHandlerParagraphs[0]) {
+    const handler = {};
+
+    const paragraph = actionHandlerParagraphs.shift();
+    if (!paragraph.isParagraphItalic) {
+      throw new Error(
+        `Action handler format error -- can't find a italic paragraph. Look for [${paragraph.text}]`
+      );
+    }
+    handler.label = paragraph.text;
+
+    while (
+      actionHandlerParagraphs[0] &&
+      !actionHandlerParagraphs[0].isParagraphItalic
+    ) {
+      handler.name = actionHandlerParagraphs.shift().text;
+      handler.data = actionHandlerParagraphs.shift().text;
+    }
+
+    if (!handler.name || !handler.data) {
+      throw new Error(
+        `Action handler format error -- handler missing name or data. Look for [${handler.label}]`
+      );
+    }
+
+    actionHandlers[handler.label.trim().toLowerCase()] = handler;
+  }
+
+  return actionHandlers;
 };
 
 const importScriptFromDocument = async (campaignId, scriptUrl) => {
@@ -369,7 +474,13 @@ const importScriptFromDocument = async (campaignId, scriptUrl) => {
     );
   }
   const document = result.data.body.content;
+  namedStyles = result.data.namedStyles.styles;
   const sections = getSections(document);
+
+  const actionHandlerParagraphs = getActionHandlers(sections) || [];
+  actionHandlers = makeActionHandlersList(
+    _.clone(actionHandlerParagraphs)
+  );
 
   const interactionParagraphs = getInteractions(sections);
   const interactionsHierarchy = makeInteractionHierarchy(

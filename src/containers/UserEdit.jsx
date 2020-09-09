@@ -37,7 +37,7 @@ const styles = StyleSheet.create({
 const fetchUser = async (organizationId, userId) =>
   apolloClient.query({
     query: gql`
-      query getEditedUser($organizationId: ID!, $userId: Int!) {
+      query getEditedUser($organizationId: String!, $userId: Int!) {
         user(organizationId: $organizationId, userId: $userId) {
           id
           firstName
@@ -262,6 +262,7 @@ export class UserEdit extends React.Component {
 
     return (
       <div>
+        {userId ? <div>User Id: {userId}</div> : null}
         <GSForm
           schema={formSchema}
           onSubmit={this.handleSave}
@@ -294,9 +295,7 @@ export class UserEdit extends React.Component {
               />
             </span>
           )}
-          {fieldsNeeded && (
-            <h3>Please complete your profile</h3>
-          )}
+          {fieldsNeeded && <h3>Please complete your profile</h3>}
           {!authType && org && org.profileFields.map(this.renderProfileField)}
           {authType && (
             <Form.Field label="Password" name="password" type="password" />

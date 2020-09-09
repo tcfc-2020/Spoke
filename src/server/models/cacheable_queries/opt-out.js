@@ -1,4 +1,5 @@
 import { r, OptOut } from "../../models";
+import campaignCache from "./campaign";
 
 // STRUCTURE
 // SET by organization, so optout-<organization_id> has a <cell> key
@@ -45,6 +46,25 @@ const loadMany = async organizationId => {
     }
     return cellOptOuts.length;
   }
+};
+
+const updateIsOptedOuts = async queryModifier => {
+  // update all organization/instance's active campaigns as well
+  const optOutContactQuery = r
+    .knex("campaign_contact")
+    .join("campaign", "campaign_contact.campaign_id", "campaign.id")
+    .where("campaign.is_archived", false)
+    .select("campaign_contact.id");
+
+  await r
+    .knex("campaign_contact")
+    .whereIn(
+      "id",
+      queryModifier ? queryModifier(optOutContactQuery) : optOutContactQuery
+    )
+    .update({
+      is_opted_out: true
+    });
 };
 
 const optOutCache = {
@@ -105,7 +125,15 @@ const optOutCache = {
       .limit(1);
     return dbResult.length > 0;
   },
-  save: async ({ cell, campaignContactId, campaign, assignmentId, reason }) => {
+  save: async ({
+    cell,
+    campaignContactId,
+    campaign,
+    assignmentId,
+    reason,
+    noContactUpdate,
+    noReply
+  }) => {
     const organizationId = campaign.organization_id;
     if (r.redis) {
       const hashKey = orgCacheKey(organizationId);
@@ -115,37 +143,37 @@ const optOutCache = {
       }
     }
     // database
-    await new OptOut({
+    await r.knex("opt_out").insert({
       assignment_id: assignmentId,
       organization_id: organizationId,
       reason_code: reason,
       cell
-    }).save();
+    });
 
-    // update all organization/instance's active campaigns as well
-    const updateOrgOrInstanceOptOuts = !sharingOptOuts
-      ? {
-          "campaign_contact.cell": cell,
-          "campaign.organization_id": organizationId,
-          "campaign.is_archived": false
-        }
-      : { "campaign_contact.cell": cell, "campaign.is_archived": false };
-    await r
-      .knex("campaign_contact")
-      .where(
-        "id",
-        "in",
-        r
-          .knex("campaign_contact")
-          .leftJoin("campaign", "campaign_contact.campaign_id", "campaign.id")
-          .where(updateOrgOrInstanceOptOuts)
-          .select("campaign_contact.id")
-      )
-      .update({
-        is_opted_out: true
-      });
+    if (noContactUpdate && r.redis) {
+      // this is a risky feature which will not update campaign_contacts
+      // Only use this when you are confident that at least the campaign's
+      // campaign_contact record will update.
+      // The first use-case was for auto-optout, where we update the contact
+      // during message save
+      // We only allow it when the cache is set, so other campaigns are still
+      // (mostly) assured to get the opt-out
+      return;
+    }
+
+    await updateIsOptedOuts(query => {
+      if (!sharingOptOuts) {
+        query.where("campaign.organization_id", organizationId);
+      }
+      return query.where("campaign_contact.cell", cell);
+    });
+
+    if (noReply) {
+      await campaignCache.incrCount(campaign.id, "needsResponseCount", -1);
+    }
   },
-  loadMany
+  loadMany,
+  updateIsOptedOuts
 };
 
 export default optOutCache;

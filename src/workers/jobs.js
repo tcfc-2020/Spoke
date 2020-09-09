@@ -7,15 +7,17 @@ import {
   User,
   UserOrganization
 } from "../server/models";
+import telemetry from "../server/telemetry";
 import { log, gunzip, zipToTimeZone, convertOffsetsToStrings } from "../lib";
-import { updateJob } from "./lib";
+import { sleep, updateJob } from "./lib";
 import serviceMap from "../server/api/lib/services";
+import twilio from "../server/api/lib/twilio";
 import {
   getLastMessage,
   saveNewIncomingMessage
 } from "../server/api/lib/message-sending";
 import importScriptFromDocument from "../server/api/lib/import-script";
-import { rawIngestMethod } from "../integrations/contact-loaders";
+import { rawIngestMethod } from "../extensions/contact-loaders";
 
 import AWS from "aws-sdk";
 import Papa from "papaparse";
@@ -23,6 +25,7 @@ import moment from "moment";
 import { sendEmail } from "../server/mail";
 import { Notifications, sendUserNotification } from "../server/notifications";
 import { getConfig } from "../server/api/lib/config";
+import { invokeTaskFunction, Tasks } from "./tasks";
 
 const defensivelyDeleteOldJobsForCampaignJobType = async job => {
   console.log("job", job);
@@ -145,20 +148,20 @@ export async function sendJobToAWSLambda(job) {
   return p;
 }
 
-export async function processSqsMessages() {
+export async function processSqsMessages(TWILIO_SQS_QUEUE_URL) {
   // hit endpoint on SQS
   // ask for a list of messages from SQS (with quantity tied to it)
   // if SQS has messages, process messages into pending_message_part and dequeue messages (mark them as handled)
   // if SQS doesnt have messages, exit
 
-  if (!process.env.TWILIO_SQS_QUEUE_URL) {
+  if (!TWILIO_SQS_QUEUE_URL) {
     return Promise.reject("TWILIO_SQS_QUEUE_URL not set");
   }
 
   const sqs = new AWS.SQS();
 
   const params = {
-    QueueUrl: process.env.TWILIO_SQS_QUEUE_URL,
+    QueueUrl: TWILIO_SQS_QUEUE_URL,
     AttributeNames: ["All"],
     MessageAttributeNames: ["string"],
     MaxNumberOfMessages: 10,
@@ -170,33 +173,36 @@ export async function processSqsMessages() {
   const p = new Promise((resolve, reject) => {
     sqs.receiveMessage(params, async (err, data) => {
       if (err) {
-        console.log(err, err.stack);
+        console.log("processSqsMessages Error", err, err.stack);
         reject(err);
-      } else if (data.Messages) {
-        console.log(data);
-        for (let i = 0; i < data.Messages.length; i++) {
-          const message = data.Messages[i];
-          const body = message.Body;
-          console.log("processing sqs queue:", body);
-          const twilioMessage = JSON.parse(body);
-
-          await serviceMap.twilio.handleIncomingMessage(twilioMessage);
-
-          sqs.deleteMessage(
-            {
-              QueueUrl: process.env.TWILIO_SQS_QUEUE_URL,
-              ReceiptHandle: message.ReceiptHandle
-            },
-            (delMessageErr, delMessageData) => {
-              if (delMessageErr) {
-                console.log(delMessageErr, delMessageErr.stack); // an error occurred
-              } else {
-                console.log(delMessageData); // successful response
-              }
+      } else {
+        if (!data.Messages || !data.Messages.length) {
+          // Since we are likely in a while(true) loop let's avoid racing
+          await sleep(10000);
+          resolve();
+        } else {
+          console.log("processSqsMessages", data.Messages.length);
+          for (let i = 0; i < data.Messages.length; i++) {
+            const message = data.Messages[i];
+            const body = message.Body;
+            if (process.env.DEBUG) {
+              console.log("processSqsMessages message body", body);
             }
-          );
+            const twilioMessage = JSON.parse(body);
+            await serviceMap.twilio.handleIncomingMessage(twilioMessage);
+            const delMessageData = await sqs
+              .deleteMessage({
+                QueueUrl: TWILIO_SQS_QUEUE_URL,
+                ReceiptHandle: message.ReceiptHandle
+              })
+              .promise()
+              .catch(reject);
+            if (process.env.DEBUG) {
+              console.log("processSqsMessages deleteresult", delMessageData);
+            }
+          }
+          resolve();
         }
-        resolve();
       }
     });
   });
@@ -251,10 +257,16 @@ export async function failedContactLoad(
     });
   if (job.id) {
     await r
-      .table("job_request")
-      .get(job.id)
+      .knex("job_request")
+      .where("id", job.id)
       .delete();
   }
+  await telemetry.reportEvent("Contact Load Failure", {
+    count: finalContactCount,
+    jobId: job.id,
+    campaignId,
+    ingestResult
+  });
 }
 
 export async function completeContactLoad(
@@ -282,28 +294,25 @@ export async function completeContactLoad(
       console.log("Error deleting opt-outs:", campaignId, err);
     });
 
-  // delete duplicate cells
+  // delete duplicate cells (last wins)
   await r
     .knex("campaign_contact")
-    .whereIn(
+    .whereNotIn(
       "id",
       r
         .knex("campaign_contact")
-        .select("campaign_contact.id")
-        .leftJoin("campaign_contact AS c2", function joinSelf() {
-          this.on("c2.campaign_id", "=", "campaign_contact.campaign_id")
-            .andOn("c2.cell", "=", "campaign_contact.cell")
-            .andOn("c2.id", ">", "campaign_contact.id");
-        })
-        .where("campaign_contact.campaign_id", campaignId)
-        .whereNotNull("c2.id")
+        .select(r.knex.raw("max(id) as id"))
+        .where("campaign_id", campaignId)
+        .groupBy("cell")
     )
+    .where("campaign_contact.campaign_id", campaignId)
     .delete()
     .then(result => {
       deleteDuplicateCells = result;
       console.log("Deduplication result", campaignId, result);
     })
     .catch(err => {
+      deleteDuplicateCells = -1;
       console.error("Failed deduplication", campaignId, err);
     });
 
@@ -323,14 +332,21 @@ export async function completeContactLoad(
       ingest_result: ingestResult || null,
       ingest_data_reference: ingestDataReference || null
     });
-
   if (job.id) {
     await r
-      .table("job_request")
-      .get(job.id)
+      .knex("job_request")
+      .where("id", job.id)
       .delete();
   }
   await cacheableData.campaign.reload(campaignId);
+  await telemetry.reportEvent("Contact Load", {
+    count: finalContactCount,
+    jobId: job.id,
+    campaignId,
+    deleteOptOutCells,
+    deleteDuplicateCells,
+    ingestResult
+  });
 }
 
 export async function unzipPayload(job) {
@@ -564,6 +580,7 @@ export async function assignTexters(job) {
           .knex("assignment")
           .where({ id: existingAssignment.id })
           .update({ max_contacts: maxContacts });
+        cacheableData.assignment.clear(existingAssignment.id);
       }
     } else {
       assignment = await new Assignment({
@@ -626,21 +643,9 @@ export async function assignTexters(job) {
 
   if (campaign.is_started) {
     console.log("assignTexterscache1", job.campaign_id);
-    if (global.TEST_ENVIRONMENT) {
-      // await the full thing if we are testing to avoid async blocks
-      await cacheableData.campaignContact.updateCampaignAssignmentCache(
-        job.campaign_id
-      );
-    } else {
-      cacheableData.campaignContact
-        .updateCampaignAssignmentCache(job.campaign_id)
-        .then(res => {
-          console.log("assignTexterscache Loaded", job.campaign_id, res);
-        })
-        .catch(err => {
-          console.log("assignTexterscache Error", job.campaign_id, err);
-        });
-    }
+    await cacheableData.campaignContact.updateCampaignAssignmentCache(
+      job.campaign_id
+    );
   }
 
   if (job.id) {
@@ -759,6 +764,7 @@ export async function exportCampaign(job) {
         "contact[optOut]": optOuts.find(ele => ele.cell === contact.cell)
           ? "true"
           : "false",
+        "contact[optOutRecord]": contact.is_opted_out,
         "contact[messageStatus]": contact.message_status,
         "contact[errorCode]": contact.error_code,
         "contact[external_id]": contact.external_id,
@@ -880,7 +886,23 @@ export async function sendMessages(queryFunc, defaultStatus) {
     try {
       let messageQuery = trx("message")
         .forUpdate()
-        .where({ send_status: defaultStatus || "QUEUED" });
+        .where({ send_status: defaultStatus || "QUEUED" })
+        .join(
+          "campaign_contact",
+          "campaign_contact.id",
+          "message.campaign_contact_id"
+        )
+        .join("campaign", "campaign.id", "campaign_contact.campaign_id")
+        .join("organization", "organization.id", "campaign.organization_id")
+        .select(
+          "message.*",
+          // These are the fields we need for message sending
+          "campaign_contact.campaign_id",
+          "campaign_contact.message_status",
+          "campaign.messageservice_sid",
+          "campaign.organization_id",
+          "organization.features"
+        );
       if (queryFunc) {
         messageQuery = queryFunc(messageQuery);
       }
@@ -910,7 +932,27 @@ export async function sendMessages(queryFunc, defaultStatus) {
           `Sending (${message.service}): ${message.user_number} -> ${message.contact_number}\nMessage: ${message.text}`
         );
         try {
-          await service.sendMessage(message, null, trx);
+          await service.sendMessage(
+            message,
+            {
+              // reconstruct contact
+              id: message.campaign_contact_id,
+              message_status: message.message_status,
+              campaign_id: message.campaign_id
+            },
+            trx,
+            {
+              // organization
+              id: message.organization_id,
+              features: message.features
+            },
+            {
+              // campaign
+              id: message.campaign_id,
+              organization_id: message.organization_id,
+              messageservice_sid: message.messageservice_sid
+            }
+          );
           pastMessages.push(message.id);
           pastMessages = pastMessages.slice(-100); // keep the last 100
         } catch (err) {
@@ -1110,10 +1152,10 @@ export async function fixOrgless() {
   } // if
 } // function
 
-export async function clearOldJobs(delay) {
+export async function clearOldJobs(event) {
   // to clear out old stuck jobs
   const twoHoursAgo = new Date(new Date() - 1000 * 60 * 60 * 2);
-  delay = delay || twoHoursAgo;
+  const delay = (event && event.oldJobPast) || twoHoursAgo;
   return await r
     .knex("job_request")
     .where({ assigned: true })
@@ -1154,6 +1196,111 @@ export async function buyPhoneNumbers(job) {
     });
   } catch (err) {
     log.error(`JOB ${job.id} FAILED: ${err.message}`, err);
+  } finally {
+    await defensivelyDeleteJob(job);
+  }
+}
+
+// Prepares a messaging service with owned number for the campaign
+async function prepareTwilioCampaign(campaign, organization, trx) {
+  const ts = Math.floor(new Date() / 1000);
+  const friendlyName = `Campaign ${campaign.id}: ${campaign.organization_id}-${ts} [${process.env.BASE_URL}]`;
+  const messagingService = await twilio.createMessagingService(
+    organization,
+    friendlyName
+  );
+  const msgSrvSid = messagingService.sid;
+  if (!msgSrvSid) {
+    throw new Error("Failed to create messaging service!");
+  }
+  const phoneSids = await trx("owned_phone_number")
+    .select("service_id")
+    .where({
+      organization_id: campaign.organization_id,
+      service: "twilio",
+      allocated_to: "campaign",
+      allocated_to_id: campaign.id.toString()
+    })
+    .map(row => row.service_id);
+  console.log(`Transferring ${phoneSids.length} numbers to ${msgSrvSid}`);
+  try {
+    await twilio.addNumbersToMessagingService(
+      organization,
+      phoneSids,
+      msgSrvSid
+    );
+  } catch (e) {
+    console.error("Failed to add numbers to messaging service", e);
+    await twilio.deleteMessagingService(organization, msgSrvSid);
+    throw new Error("Failed to add numbers to messaging service");
+  }
+  return msgSrvSid;
+}
+
+// Start a campaign when EXPERIMENTAL_CAMPAIGN_PHONE_NUMBERS is enabled
+// TODO: refactor this to share more code with the startCampaign mutation
+export async function startCampaignWithPhoneNumbers(job) {
+  if (!job.campaign_id) {
+    throw new Error("Missing job.campaign_id");
+  }
+  try {
+    let organization;
+    await r.knex.transaction(async trx => {
+      const campaign = await trx("campaign")
+        .where("id", job.campaign_id)
+        // PG only: lock this campaign while starting, making this job idempotent
+        .forUpdate()
+        .first();
+      if (campaign.is_started) {
+        throw new Error("Campaign already started");
+      }
+      organization = await trx("organization")
+        .where("id", campaign.organization_id)
+        .first();
+      const service = getConfig("DEFAULT_SERVICE", organization);
+
+      let messagingServiceSid;
+      if (service === "twilio") {
+        messagingServiceSid = await prepareTwilioCampaign(
+          campaign,
+          organization,
+          trx
+        );
+      } else if (service === "fakeservice") {
+        // simulate some latency
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        messagingServiceSid = "FAKEMESSAGINGSERVICE";
+      } else {
+        throw new Error(
+          `Campaign phone numbers are not supported for service ${service}`
+        );
+      }
+
+      await trx("campaign")
+        .where("id", campaign.id)
+        .update({
+          is_started: true,
+          use_own_messaging_service: true,
+          messageservice_sid: messagingServiceSid
+        });
+    });
+
+    await cacheableData.campaign.clear(job.campaign_id);
+    const reloadedCampaign = await cacheableData.campaign.load(job.campaign_id);
+
+    await sendUserNotification({
+      type: Notifications.CAMPAIGN_STARTED,
+      campaignId: job.campaign_id
+    });
+
+    // We are already in an background job process, so invoke the task directly rather than
+    // kicking it off through the dispatcher
+    await invokeTaskFunction(Tasks.CAMPAIGN_START_CACHE, {
+      organization,
+      campaign: reloadedCampaign
+    });
+  } catch (e) {
+    console.error(`Job ${job.id} failed: ${e.message}`, e);
   } finally {
     await defensivelyDeleteJob(job);
   }
